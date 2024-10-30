@@ -5,31 +5,23 @@ import time
 import jwt
 import requests
 import os
+from pathlib import Path
 
 router = APIRouter()
 
-# 認証の設定
+# OAuthとAPI設定
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+API_URL = "https://api.klingai.com/v1/videos/image2video"
+ACCESS_KEY = "e250a0fa119449199b232e0fe32728e9"
+SECRET_KEY = "0bc00ee72c694122b393772e99336ce8"
 
-# アクセスキーとシークレットキーを設定
-ACCESS_KEY = "e250a0fa119449199b232e0fe32728e9"  # アクセスキーを入力してください
-SECRET_KEY = "0bc00ee72c694122b393772e99336ce8"  # シークレットキーを入力してください
-
-# JWTトークンを生成する関数
+# JWTトークン生成関数
 def encode_jwt_token(ak: str, sk: str) -> str:
-    headers = {
-        "alg": "HS256",
-        "typ": "JWT"
-    }
-    payload = {
-        "iss": ak,
-        "exp": int(time.time()) + 1800,  # 有効時間30分
-        "nbf": int(time.time()) - 5  # 現在時刻から5秒前に開始
-    }
-    token = jwt.encode(payload, sk, algorithm='HS256', headers=headers)
-    return token
+    headers = {"alg": "HS256", "typ": "JWT"}
+    payload = {"iss": ak, "exp": int(time.time()) + 1800, "nbf": int(time.time()) - 5}
+    return jwt.encode(payload, sk, algorithm='HS256', headers=headers)
 
-# リクエストボディのモデル
+# レスポンスモデル
 class TaskResponse(BaseModel):
     task_id: str
     task_status: str
@@ -42,92 +34,89 @@ class QueryTaskResponse(BaseModel):
     request_id: str
     data: TaskResponse
 
-# 画像をアップロードし、動画を生成するエンドポイント
-@router.post("/v1/videos/image2video/{order_id}", response_model=QueryTaskResponse)
-async def create_video(order_id: str, file: UploadFile = File(...), token: str = Depends(oauth2_scheme)):
-    # JWTトークンの生成
+# 画像をアップロードし動画を生成するエンドポイント
+@router.post("/v1/videos/image2video/{product_id}", response_model=QueryTaskResponse)
+async def create_video(product_id: str, file: UploadFile = File(...), prompt: str = "", token: str = Depends(oauth2_scheme)):
     authorization = encode_jwt_token(ACCESS_KEY, SECRET_KEY)
+    temp_dir = Path(f"files/product/{product_id}")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    merge_image_path = temp_dir / "merge.jpg"
 
-    # 一時ファイルを保存
-    original_image_path = f"./files/order/{order_id}/original.jpg"
-    os.makedirs(os.path.dirname(original_image_path), exist_ok=True)  # ディレクトリがなければ作成
-    with open(original_image_path, "wb") as f:
+    # アップロードされた画像を一時ディレクトリに保存
+    with merge_image_path.open("wb") as f:
         f.write(await file.read())
 
-    # APIリクエストを送信
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {authorization}"
-    }
-    
-    api_url = "https://api.klingai.com/v1/videos/image2video"
-    # 画像ファイルのパスを指定
-    data = {"image_url": f"file://{os.path.abspath(original_image_path)}"}
-    response = requests.post(api_url, headers=headers, json=data)
-    
-    if response.status_code != 200:
-        os.remove(original_image_path)  # エラー時には画像ファイルを削除
-        raise HTTPException(status_code=response.status_code, detail=response.json().get("message", "Unknown error"))
-    
-    # 生成された動画のファイル名を取得（例としてtask_idを使用）
-    task_data = response.json().get("data", {})
-    task_id = task_data.get("task_id")
-    generated_video_path = f"./files/order/{order_id}/{task_id}.mp4"
-    
-    # 動画ファイルを保存する処理をここに追加
-    # ここではダミー処理としてファイルを作成しています
-    # 本来は、APIから返された動画のダウンロード処理を実装する必要があります
-    with open(generated_video_path, "w", encoding="utf-8") as f:  # 通常のテキストモードで開く
-        f.write("このファイルはダミーです")  # UTF-8で書き込む
+    # APIヘッダーとデータの設定
+    headers = {"Authorization": f"Bearer {authorization}"}
+    files = {'image': (merge_image_path.name, open(merge_image_path, 'rb'), 'image/jpeg')}
+    data = {'prompt': prompt}
 
-    # 一時ファイルを削除
-    os.remove(original_image_path)
+    # APIリクエストを送信
+    response = requests.post(API_URL, headers=headers, files=files, data=data)
+
+    # エラーチェックと処理
+    if response.status_code != 200:
+        os.remove(merge_image_path)
+        error_message = response.json().get("message", "不明なエラー")
+        raise HTTPException(status_code=response.status_code, detail=error_message)
+
+    response_json = response.json()
+    if response_json["code"] != 0:  # 0が成功コードと仮定
+        os.remove(merge_image_path)
+        raise HTTPException(status_code=400, detail=response_json["message"])
+
+    # タスクIDを使用して動画ファイルを生成（ダミー処理）
+    task_data = response_json["data"]
+    task_id = task_data["task_id"]
+    generated_video_path = temp_dir / f"{task_id}.mp4"
+
+    with open(generated_video_path, "w", encoding="utf-8") as f:
+        f.write("これはダミーファイルです")
+
+    os.remove(merge_image_path)
 
     return {
-        "code": 200,
-        "message": "Success",
-        "request_id": "dummy_request_id",  # 実際のrequest_idに置き換える
+        "code": 0,
+        "message": "成功",
+        "request_id": response_json["request_id"],
         "data": {
             "task_id": task_id,
-            "task_status": "生成中",  # 実際のステータスに置き換える
-            "created_at": int(time.time()),
-            "updated_at": int(time.time())
+            "task_status": task_data["task_status"],
+            "created_at": task_data["created_at"],
+            "updated_at": task_data["updated_at"]
         }
     }
-
 
 # タスクの状態を取得するエンドポイント
 @router.get("/v1/videos/image2video/{task_id}", response_model=QueryTaskResponse)
 async def query_task(task_id: str, token: str = Depends(oauth2_scheme)):
-    # JWTトークンの生成
     authorization = encode_jwt_token(ACCESS_KEY, SECRET_KEY)
+    headers = {"Authorization": f"Bearer {authorization}"}
+    api_url = f"{API_URL}/{task_id}"
 
-    # APIリクエストを送信
-    headers = {
-        "Authorization": f"Bearer {authorization}"
-    }
-    api_url = f"https://api.klingai.com/v1/videos/image2video/{task_id}"
     response = requests.get(api_url, headers=headers)
-    
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=response.json().get("message", "Unknown error"))
 
-    return response.json()
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail=response.json().get("message", "不明なエラー"))
+
+    response_json = response.json()
+    if response_json["code"] != 0:
+        raise HTTPException(status_code=400, detail=response_json["message"])
+
+    return response_json
 
 # タスクの一覧を取得するエンドポイント
 @router.get("/v1/videos/image2video", response_model=QueryTaskResponse)
 async def query_tasks(token: str = Depends(oauth2_scheme)):
-    # JWTトークンの生成
     authorization = encode_jwt_token(ACCESS_KEY, SECRET_KEY)
+    headers = {"Authorization": f"Bearer {authorization}"}
+    response = requests.get(API_URL, headers=headers)
 
-    # APIリクエストを送信
-    headers = {
-        "Authorization": f"Bearer {authorization}"
-    }
-    api_url = "https://api.klingai.com/v1/videos/image2video"
-    response = requests.get(api_url, headers=headers)
-    
     if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=response.json().get("message", "Unknown error"))
+        raise HTTPException(status_code=response.status_code, detail=response.json().get("message", "不明なエラー"))
 
-    return response.json()
+    response_json = response.json()
+    if response_json["code"] != 0:
+        raise HTTPException(status_code=400, detail=response_json["message"])
+
+    return response_json
