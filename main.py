@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from app.database import init_db
-from app.routers import photo, webhook, upload
+from app.routers import photo, webhook, upload, media
 from app.auth import create_access_token  # auth.pyからインポート
 import os
 from dotenv import load_dotenv
@@ -55,3 +55,4 @@ def admin_auth(credentials: HTTPBasicCredentials = Depends(HTTPBasic())):
 app.include_router(photo.router)
 app.include_router(webhook.router)
 app.include_router(upload.router)
+app.include_router(media.router)

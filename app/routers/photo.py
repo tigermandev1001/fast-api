@@ -117,18 +117,4 @@ async def get_media_url(order_id: str, media_type: str):
     media_url = generate_media_url(order_id, media_type)
     return {"media_url": media_url}
 
-# メディアファイル提供エンドポイント
-@app.get("/files/{order_id}/{media_type:path}")
-async def get_media(order_id: str, media_type: str, token: str = Query(...)):
-    if not validate_token(token):
-        raise HTTPException(status_code=403, detail="無効または期限切れのトークンです。")
-    
-    file_path = IMAGE_DIR / f"{order_id}/{media_type}"
-    
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="ファイルが見つかりません。")
-    
-    return FileResponse(file_path, media_type="image/jpeg")
-
-# ルーターを登録
 app.include_router(router)
