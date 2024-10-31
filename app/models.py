@@ -41,7 +41,7 @@ class Product(Base):
     product_id = Column(String(20), nullable=False)
     name = Column(String(100), nullable=False)
     prompt = Column(JSON)
-    bmg = Column(JSON)
+    bmg = Column(String(100))
 
 
 class Service(Base):

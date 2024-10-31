@@ -3,26 +3,26 @@ import hmac
 import hashlib
 import time
 import base64
-from fastapi import APIRouter, FastAPI, HTTPException, Query
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
+from fastapi import APIRouter, UploadFile, File, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+import httpx
 from pathlib import Path
 from PIL import Image
+import logging
 
 app = FastAPI()
-
 router = APIRouter()
 
-# 50文字の秘密鍵を生成する関数（32バイト + パディング）
-def generate_secret_key() -> str:
-    return base64.urlsafe_b64encode(os.urandom(32)).decode()  # 32バイト = 256ビット
-
-IMAGE_DIR = Path("files/product")
-IMAGE_DIR.mkdir(parents=True, exist_ok=True)  # Ensure directory exists
-
-# Secret key and token functions
+# 定数
 SECRET_KEY = "IF4ogCin288G-Tgz5F3fpsuBD_0tmBDcu32xcbwPEklzyT_-eTINA8ehP2wlhAeh1j4"
+IMAGE_DIR = Path("files/order")
+MODEL_DIR = Path("files/model")
 
+# 必要なディレクトリを作成
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# トークン生成関数（有効期限付き）
 def generate_token(file_name: str, expiration_seconds: int = 3600) -> str:
     expire_time = int(time.time()) + expiration_seconds
     data = f"{file_name}:{expire_time}"
@@ -30,134 +30,105 @@ def generate_token(file_name: str, expiration_seconds: int = 3600) -> str:
     token = base64.urlsafe_b64encode(f"{data}:{signature.hex()}".encode()).decode()
     return token
 
+# トークン検証関数
 def validate_token(token: str) -> bool:
     try:
         decoded_token = base64.urlsafe_b64decode(token).decode()
         data, signature = decoded_token.rsplit(":", 1)
         file_name, expire_time = data.split(":")
-        
+
         if int(expire_time) < int(time.time()):
             return False
-        
+
         expected_signature = hmac.new(SECRET_KEY.encode(), data.encode(), hashlib.sha256).digest()
-        if not hmac.compare_digest(signature, expected_signature.hex()):
-            return False
-        
-        return True
+        return hmac.compare_digest(signature, expected_signature.hex())
     except Exception:
         return False
 
-# 画像の位置調整と合成用の関数
-def combine_images(user_image_path, model_image_path, output_path):
-    # モデル画像とユーザー画像の読み込み
+# 画像を結合する関数
+def combine_images(original_image_path: Path, model_image_path: Path, output_path: Path):
     model_image = Image.open(model_image_path).convert("RGBA")
-    user_image = Image.open(user_image_path).convert("RGBA")
-    
+    original_image = Image.open(original_image_path).convert("RGBA")
+
     # アバターサイズを定義
     avatar_size = (100, 100)
 
-    # ユーザーアバターのリサイズ
-    user_avatar = user_image.resize(avatar_size, Image.LANCZOS)
+    # ユーザー画像とモデル画像をリサイズ
+    user_avatar = original_image.resize(avatar_size, Image.LANCZOS)
     model_avatar = model_image.resize(avatar_size, Image.LANCZOS)
 
-    # 合成画像キャンバス作成
-    combined_width = avatar_size[0] * 2
-    combined_height = avatar_size[1]
-    combined_image = Image.new("RGBA", (combined_width, combined_height), (255, 255, 255, 0))
+    # 結合画像のキャンバスを作成
+    combined_image = Image.new("RGBA", (avatar_size[0] * 2, avatar_size[1]), (255, 255, 255, 0))
 
-    # ユーザーアバターとモデルアバターを合成
+    # 両方のアバターを貼り付け
     combined_image.paste(user_avatar, (0, 0))
     combined_image.paste(model_avatar, (avatar_size[0], 0))
 
-    # RGB変換とJPEG保存
-    combined_image = combined_image.convert("RGB")
-    combined_image.save(output_path, format="JPEG")
-    print(f"合成画像が保存されました: {output_path}")
+    # RGB JPEGとして保存
+    combined_image.convert("RGB").save(output_path, format="JPEG")
+    print(f"結合画像が保存されました: {output_path}")
 
-# メディアURL生成
-def generate_media_url(product_id: str, media_type: str) -> str:
-    file_name = f"{product_id}/{media_type}"
+# メディアURL生成関数
+def generate_media_url(order_id: str, media_type: str) -> str:
+    file_name = f"{order_id}/{media_type}"
     token = generate_token(file_name)
     return f"https://memory.blotocol.net/files/{file_name}?token={token}"
 
-# 画像ダウンロードと合成
-def download_images_and_combine(image_urls: list, product_id: str):
-    product_dir = IMAGE_DIR / str(product_id)
-    product_dir.mkdir(parents=True, exist_ok=True)
+# 画像をダウンロードして結合する関数
+async def download_images_and_combine(image_url: str, order_id: str, product_id: str, image_model: UploadFile):
+    order_dir = IMAGE_DIR / str(order_id)
+    order_dir.mkdir(parents=True, exist_ok=True)
 
-    if len(image_urls) < 3:
-        print("画像が不足しています。ユーザー、モデル、商品画像が必要です。")
-        return []
-
-    # 画像のURL順にユーザー画像、モデル画像、商品画像を設定
-    user_image_url = image_urls[0]
-    model_image_url = image_urls[1]
-    product_image_url = image_urls[2]
-
+    # ユーザー画像をダウンロード
+    original_image_path = order_dir / "original.jpg"
     try:
-        # ユーザー画像のダウンロード
-        user_image_path = product_dir / "origine.jpg"
-        with requests.get(user_image_url, stream=True) as response:
-            response.raise_for_status()
-            with open(user_image_path, "wb") as f:
-                for chunk in response.iter_content(1024):
-                    f.write(chunk)
-        print(f"ユーザー画像がダウンロードされました: {user_image_path}")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(image_url)
+            response.raise_for_status()  # ステータスコードを確認
+            with open(original_image_path, "wb") as f:
+                f.write(response.content)
+        print(f"ユーザー画像がダウンロードされました: {original_image_path}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=400, detail=f"ユーザー画像のダウンロードに失敗しました: {e}")
 
-        # モデル画像のダウンロード
-        model_image_path = product_dir / "model_image.jpg"
-        with requests.get(model_image_url, stream=True) as response:
-            response.raise_for_status()
-            with open(model_image_path, "wb") as f:
-                for chunk in response.iter_content(1024):
-                    f.write(chunk)
-        print(f"モデル画像がダウンロードされました: {model_image_path}")
+    # アップロードされたモデル画像を保存
+    image_model_path = MODEL_DIR / f"{product_id}.jpg"
 
-        # ユーザー画像とモデル画像の合成
-        combined_image_path = product_dir / "merge.jpg"
-        combine_images(user_image_path, model_image_path, combined_image_path)
+    logging.info(f"受信した注文データ: {image_url}, 注文ID: {order_id}, 商品ID: {product_id}")
+    
+ 
 
-        # 商品画像のダウンロード
-        product_image_path = product_dir / "product_image.jpg"
-        with requests.get(product_image_url, stream=True) as response:
-            response.raise_for_status()
-            with open(product_image_path, "wb") as f:
-                for chunk in response.iter_content(1024):
-                    f.write(chunk)
-        print(f"商品画像がダウンロードされました: {product_image_path}")
+    # 画像を結合
+    combined_image_path = order_dir / "merge.jpg"
+    combine_images(original_image_path, image_model_path, combined_image_path)
+    print(f"結合画像が作成されました: {combined_image_path}")
 
-        return [str(user_image_path), str(combined_image_path), str(product_image_path)]
-    except requests.RequestException as e:
-        print(f"画像のダウンロードに失敗しました: {e}")
-        return []
+    return {"combined_image_url": generate_media_url(order_id, "merge.jpg")}
 
-def download_images_concurrently(image_urls: list, product_id: str, max_workers: int = 5) -> list:
-    """Download images concurrently and return their local file paths."""
-    image_paths = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_url = {
-            executor.submit(combine_images, url, product_id, index): url
-            for index, url in enumerate(image_urls)
-        }
-        for future in as_completed(future_to_url):
-            file_path = future.result()
-            if file_path:
-                image_paths.append(file_path)
-    return image_paths
+# 画像アップロードと結合のエンドポイント
+@router.post("/combine-images/")
+async def combine_images_endpoint(image_url: str, order_id: str, product_id: str, image_model: UploadFile = File(...)):
+    urls = await download_images_and_combine(image_url, order_id, product_id, image_model)
+    return urls
 
+# メディアURL生成エンドポイント
 @app.get("/generate-url")
-async def get_media_url(product_id: str, media_type: str):
-    media_url = generate_media_url(product_id, media_type)
+async def get_media_url(order_id: str, media_type: str):
+    media_url = generate_media_url(order_id, media_type)
     return {"media_url": media_url}
 
+# メディアファイル提供エンドポイント
 @app.get("/files/{order_id}/{media_type:path}")
 async def get_media(order_id: str, media_type: str, token: str = Query(...)):
     if not validate_token(token):
-        raise HTTPException(status_code=403, detail="Invalid or expired token.")
+        raise HTTPException(status_code=403, detail="無効または期限切れのトークンです。")
     
     file_path = IMAGE_DIR / f"{order_id}/{media_type}"
     
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found.")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="ファイルが見つかりません。")
     
-    return {"message": f"Providing {media_type} from {file_path}"}
+    return FileResponse(file_path, media_type="image/jpeg")
+
+# ルーターを登録
+app.include_router(router)
